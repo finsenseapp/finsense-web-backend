@@ -1,0 +1,341 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AccountType {
+  BANK
+  CASH
+  CREDIT_CARD
+  E_WALLET
+}
+
+enum CategoryType {
+  INCOME
+  EXPENSE
+}
+
+enum TransactionType {
+  INCOME
+  EXPENSE
+  TRANSFER
+}
+
+enum TransactionSource {
+  MANUAL
+  AI_IMPORT
+}
+
+enum UserRole {
+  USER
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  currency     String   @default("LKR")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  role               UserRole   @default(USER)
+  status             UserStatus @default(ACTIVE)
+  /// Set for the seeded admin: the first login must replace the default password.
+  mustChangePassword Boolean    @default(false)
+  lastLoginAt        DateTime?
+  suspendedAt        DateTime?
+  suspendReason      String?
+
+  accounts      Account[]
+  categories    Category[]
+  transactions  Transaction[]
+  budgets       Budget[]
+  notifications Notification[]
+  recurringRules RecurringRule[]
+  savingsGoals   SavingsGoal[]
+  chatMessages   ChatMessage[]
+}
+
+model Account {
+  id        String      @id @default(uuid())
+  userId    String
+  name      String
+  type      AccountType
+  /// The currency this account holds. `balance` is in this currency. Existing accounts are LKR.
+  currency  String      @default("LKR")
+  balance   Decimal     @default(0) @db.Decimal(14, 2)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  user                 User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions         Transaction[] @relation("TransactionAccount")
+  incomingTransactions Transaction[] @relation("TransactionToAccount")
+  recurringRules       RecurringRule[]  @relation("RecurringAccount")
+  incomingRecurring    RecurringRule[]  @relation("RecurringToAccount")
+
+  @@unique([userId, name])
+}
+
+model Category {
+  id        String       @id @default(uuid())
+  userId    String? // null = system default category
+  name      String
+  type      CategoryType
+  icon      String
+  createdAt DateTime     @default(now())
+
+  user         User?         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+  budgets      Budget[]
+  recurringRules RecurringRule[]
+
+  @@index([userId])
+}
+
+model Transaction {
+  id             String            @id @default(uuid())
+  userId         String
+  accountId      String
+  toAccountId    String?
+  categoryId     String?
+  /// The value in LKR (the base currency): what dashboards, budgets and reports add up.
+  amount         Decimal           @db.Decimal(14, 2)
+  /// Exact amount in the account's own currency. Null for LKR accounts (then it equals `amount`).
+  accountAmount  Decimal?          @db.Decimal(14, 2)
+  /// A transfer's amount as credited to the destination account, in that account's currency. Null when it equals `amount`.
+  toAmount       Decimal?          @db.Decimal(14, 2)
+  /// LKR per 1 unit of the account's currency, on the transaction's date. Null for LKR accounts.
+  rate           Decimal?          @db.Decimal(18, 8)
+  type           TransactionType
+  description    String
+  rawDescription String?
+  merchantName   String?
+  aiConfidence   Float?
+  source         TransactionSource @default(MANUAL)
+  /// Rows created together by "split across categories" share this id: each part is a normal transaction.
+  splitGroupId   String?
+  date           DateTime
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account   Account   @relation("TransactionAccount", fields: [accountId], references: [id], onDelete: Restrict)
+  toAccount Account?  @relation("TransactionToAccount", fields: [toAccountId], references: [id], onDelete: Restrict)
+  category  Category? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  attachments Attachment[]
+
+  @@index([userId, date])
+  @@index([accountId])
+  @@index([splitGroupId])
+}
+
+model Budget {
+  id          String   @id @default(uuid())
+  userId      String
+  categoryId  String
+  amountLimit Decimal  @db.Decimal(14, 2)
+  month       Int
+  year        Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, categoryId, month, year])
+}
+
+/// Security-relevant events. No foreign keys on purpose: entries must outlive the users they describe. Never holds
+/// money or personal finance data, only who did what to whom (emails are stored masked).
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String
+  actorId     String?
+  actorLabel  String?
+  targetId    String?
+  targetLabel String?
+  ip          String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([action, createdAt])
+}
+
+enum NotificationType {
+  BUDGET_WARNING
+  BUDGET_EXCEEDED
+  GOAL_REACHED
+  RECURRING_POSTED
+  SYSTEM
+}
+
+/// In-app notifications (the bell). Amounts live in `data` so the app can show them in the user's display currency.
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  title     String
+  /// Everything needed to render the message (names, amounts in LKR, month): never free text from other people.
+  data      Json?
+  link      String?
+  /// Makes generating the same alert twice harmless, for example "budget X, March, 80%".
+  dedupeKey String?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt])
+}
+
+enum RecurrenceFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+}
+
+/// A transaction that repeats (rent, salary, subscriptions). A background job posts each due occurrence as a normal
+/// transaction. `nextRunAt` is the start of the next due day in the app time zone.
+model RecurringRule {
+  id          String              @id @default(uuid())
+  userId      String
+  accountId   String
+  toAccountId String?
+  categoryId  String?
+  type        TransactionType
+  amount      Decimal             @db.Decimal(14, 2)
+  description String
+  frequency   RecurrenceFrequency
+  /// Every N days / weeks / months / years.
+  interval    Int                 @default(1)
+  startDate   DateTime
+  endDate     DateTime?
+  nextRunAt   DateTime
+  lastRunAt   DateTime?
+  lastError   String?
+  active      Boolean             @default(true)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  account   Account   @relation("RecurringAccount", fields: [accountId], references: [id], onDelete: Cascade)
+  toAccount Account?  @relation("RecurringToAccount", fields: [toAccountId], references: [id], onDelete: Cascade)
+  category  Category? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([active, nextRunAt])
+}
+
+/// A savings goal. It is a virtual envelope: contributions do not move money between accounts, they only record
+/// how much of the target has been set aside. Saved = the sum of the contributions.
+model SavingsGoal {
+  id           String    @id @default(uuid())
+  userId       String
+  name         String
+  targetAmount Decimal   @db.Decimal(14, 2)
+  targetDate   DateTime?
+  /// Set the first time the saved amount reaches the target.
+  achievedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contributions GoalContribution[]
+
+  @@index([userId])
+}
+
+model GoalContribution {
+  id        String   @id @default(uuid())
+  goalId    String
+  userId    String
+  /// Positive = money put aside, negative = taken back out.
+  amount    Decimal  @db.Decimal(14, 2)
+  date      DateTime
+  note      String?
+  createdAt DateTime @default(now())
+
+  goal SavingsGoal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  @@index([goalId])
+}
+
+/// A receipt (photo or PDF) attached to a transaction. The file lives on disk under uploads/<userId>/<storageKey>,
+/// never in a public folder: it is only served through the authenticated API.
+model Attachment {
+  id            String   @id @default(uuid())
+  userId        String
+  transactionId String
+  filename      String
+  mimeType      String
+  size          Int
+  storageKey    String
+  createdAt     DateTime @default(now())
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@index([transactionId])
+  @@index([userId])
+}
+
+/// Exchange rates on one past day (units of each currency per 1 LKR), cached so a date is fetched only once.
+model DayRates {
+  /// YYYY-MM-DD
+  date      String   @id
+  rates     Json
+  fetchedAt DateTime @default(now())
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+}
+
+/// The assistant chat, kept on the server so it survives a refresh and a new device. Only the user's own words and the
+/// assistant's replies: never tool results (those are rebuilt from live data each time).
+model ChatMessage {
+  id        String   @id @default(uuid())
+  userId    String
+  role      ChatRole
+  content   String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+/// Errors seen by the server and the browser, grouped by fingerprint so a repeating error is one row with a count.
+/// Holds only what is needed to fix the bug (message, stack, address): no request bodies, no user content.
+model ErrorLog {
+  id          String    @id @default(uuid())
+  /// "server" or "client"
+  source      String
+  fingerprint String    @unique
+  message     String
+  stack       String?
+  url         String?
+  userAgent   String?
+  /// The last user who hit it (an id, not an email).
+  userId      String?
+  count       Int       @default(1)
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @default(now())
+  resolvedAt  DateTime?
+
+  @@index([resolvedAt, lastSeenAt])
+}
