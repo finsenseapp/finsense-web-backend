@@ -12,6 +12,8 @@ const envSchema = z.object({
   APP_TIMEZONE: z.string().default("Asia/Colombo"),
   /** Folder for uploaded receipts (relative paths are resolved from where the server starts). Never web-accessible. */
   UPLOAD_DIR: z.string().default("uploads"),
+  /** How many proxies sit in front of the server (0 = none, for local development). Hosted behind Vercel + Render this is 2, so rate limits and the audit log see the visitor IP. */
+  TRUST_PROXY: z.coerce.number().int().min(0).max(5).default(0),
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   // Required since Phase 6. Empty values count as missing.
   GEMINI_API_KEY: z.preprocess(
