@@ -4,3 +4,6 @@ node_modules
 dist
 .next
 src/generated
+
+# Uploaded receipts (private user files)
+/uploads/
